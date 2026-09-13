@@ -1,0 +1,11 @@
+Package: orphan-watchdog
+Version: 1.0.4
+Section: admin
+Priority: optional
+Architecture: all
+Maintainer: Thy <thy@local>
+Depends: python3 (>= 3.8), systemd
+Description: Autonomous watchdog and MCP process supervisor for Linux workstations
+ Protects desktop workstations from runaway orphaned background processes,
+ broken pipe spin-loops, and orphaned MCP servers. Designed for Ubuntu 24.04 LTS
+ and higher.

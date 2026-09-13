@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Watchdog utility for inspecting and terminating abandoned, runaway user processes.
+
+Periodically invoked (via systemd timer) to inspect user-slice processes reparented
+to systemd/init that lack a controlling terminal and consume sustained CPU cycles.
+"""
+
+import argparse
+import os
+import signal
+import syslog
+import time
+
+CONFIG_FILE = "/etc/orphan-watchdog.conf"
+
+# Minimal generic desktop/system infrastructure whitelist (must be lowercase).
+# Site- or application-specific exceptions belong in /etc/orphan-watchdog.conf.
+DEFAULT_WHITELIST = {
+    "systemd", "init", "dbus-daemon", "pipewire", "wireplumber",
+    "pulseaudio", "xwayland", "gnome-shell", "polkitd"
+}
+
+# Note: Linux kernel limits /proc/[pid]/comm to 15 characters (TASK_COMM_LEN - 1).
+# Names longer than 15 chars will be truncated in comm.
+DEFAULT_TARGETS = {"node", "npm", "npx", "mcp-server", "python", "python3"}
+DEFAULT_CPU_THRESHOLD = 40.0
+DEFAULT_TARGET_CPU_THRESHOLD = 25.0
+DEFAULT_SAMPLE_INTERVAL = 1.0
+
+def load_config():
+    whitelist = set(DEFAULT_WHITELIST)
+    targets = set(DEFAULT_TARGETS)
+    cpu_thresh = DEFAULT_CPU_THRESHOLD
+    target_cpu_thresh = DEFAULT_TARGET_CPU_THRESHOLD
+    sample_sec = DEFAULT_SAMPLE_INTERVAL
+    dry_run = False
+
+    if not os.path.isfile(CONFIG_FILE):
+        return whitelist, targets, cpu_thresh, target_cpu_thresh, sample_sec, dry_run
+
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip().upper()
+                val = val.strip()
+
+                if key == "WHITELIST":
+                    whitelist.update(item.strip().lower() for item in val.split(",") if item.strip())
+                elif key == "TARGETS":
+                    targets.update(item.strip().lower() for item in val.split(",") if item.strip())
+                elif key == "CPU_THRESHOLD":
+                    cpu_thresh = float(val)
+                elif key == "TARGET_CPU_THRESHOLD":
+                    target_cpu_thresh = float(val)
+                elif key == "SAMPLE_INTERVAL":
+                    sample_sec = float(val)
+                elif key == "DRY_RUN":
+                    dry_run = val.lower() in ("true", "1", "yes")
+    except (OSError, ValueError) as err:
+        syslog.syslog(syslog.LOG_ERR, f"orphan-watchdog: failed to read {CONFIG_FILE}: {err}")
+
+    return whitelist, targets, cpu_thresh, target_cpu_thresh, sample_sec, dry_run
+
+def is_reparented(ppid: int) -> bool:
+    if ppid == 1:
+        return True
+    try:
+        with open(f"/proc/{ppid}/comm", encoding="utf-8") as f:
+            return f.read().strip() in ("systemd", "init")
+    except OSError:
+        return False
+
+def get_proc_stat(pid: int):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            raw = f.read()
+        l_idx = raw.find("(")
+        r_idx = raw.rfind(")")
+        if l_idx == -1 or r_idx == -1:
+            return None
+        comm = raw[l_idx + 1:r_idx]
+        fields = raw[r_idx + 2:].split()
+        return {
+            "pid": pid,
+            "comm": comm,
+            "ppid": int(fields[1]),
+            "tty_nr": int(fields[4]),
+            "ticks": int(fields[11]) + int(fields[12]),
+            "starttime": int(fields[19]),
+        }
+    except (OSError, IndexError, ValueError):
+        return None
+
+def is_system_slice(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as f:
+            return any("/system.slice" in line for line in f)
+    except OSError:
+        # If cgroup cannot be determined, fail closed to protect system processes
+        return True
+
+def terminate_process(pid: int, comm: str, cpu_pct: float, dry_run: bool = False) -> None:
+    prefix = "[dry-run] would terminate" if dry_run else "terminating"
+    msg = f"orphan-watchdog: {prefix} runaway orphan {comm}[{pid}] ({cpu_pct:.1f}% CPU)"
+    syslog.syslog(syslog.LOG_WARNING, msg)
+    print(msg)
+
+    if dry_run:
+        return
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError as err:
+        syslog.syslog(syslog.LOG_ERR, f"orphan-watchdog: cannot SIGTERM {pid}: {err}")
+        return
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+        syslog.syslog(syslog.LOG_WARNING, f"orphan-watchdog: sent SIGKILL to {comm}[{pid}]")
+    except ProcessLookupError:
+        pass
+    except PermissionError as err:
+        syslog.syslog(syslog.LOG_ERR, f"orphan-watchdog: cannot SIGKILL {pid}: {err}")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Audit and terminate runaway orphaned processes.")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Audit mode: log actions without sending signals.")
+    args = parser.parse_args()
+
+    syslog.openlog(ident="orphan-watchdog", facility=syslog.LOG_DAEMON)
+    whitelist, targets, cpu_thresh, target_cpu_thresh, sample_sec, config_dry_run = load_config()
+    dry_run = args.dry_run or config_dry_run
+
+    try:
+        clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+    except (KeyError, ValueError, OSError):
+        clk_tck = 100
+
+    tracked = {}
+
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+
+        stat = get_proc_stat(pid)
+        if not stat:
+            continue
+
+        comm = stat["comm"].lower()
+        if comm in whitelist:
+            continue
+
+        if stat["tty_nr"] != 0:
+            continue
+
+        if not is_reparented(stat["ppid"]):
+            continue
+
+        if is_system_slice(pid):
+            continue
+
+        tracked[pid] = (stat, time.monotonic())
+
+    if not tracked:
+        return
+
+    time.sleep(sample_sec)
+
+    now = time.monotonic()
+    for pid, (initial_stat, start_time) in tracked.items():
+        current_stat = get_proc_stat(pid)
+        if not current_stat:
+            continue
+
+        # Prevent TOCTOU PID reuse race: verify process starttime identity
+        if current_stat["starttime"] != initial_stat["starttime"]:
+            continue
+
+        elapsed = now - start_time
+        if elapsed <= 0:
+            continue
+
+        delta_ticks = current_stat["ticks"] - initial_stat["ticks"]
+        cpu_pct = (delta_ticks / (elapsed * clk_tck)) * 100.0
+
+        comm = current_stat["comm"].lower()
+        is_target = any(target in comm for target in targets)
+        threshold = target_cpu_thresh if is_target else cpu_thresh
+
+        if cpu_pct >= threshold:
+            terminate_process(pid, current_stat["comm"], cpu_pct, dry_run=dry_run)
+
+if __name__ == "__main__":
+    main()

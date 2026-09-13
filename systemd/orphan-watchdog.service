@@ -1,0 +1,11 @@
+[Unit]
+Description=Orphan and Runaway Process Watchdog
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/orphan-watchdog
+StandardOutput=journal
+StandardError=journal
+Nice=19
+CPUSchedulingPolicy=idle

@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Process supervisor for MCP servers and transient subprocesses.
+
+Binds child process group lifecycle to the invoking parent via kernel-level
+PR_SET_PDEATHSIG and stdio stream tracking.
+"""
+
+from collections import deque
+import ctypes
+import fcntl
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+PR_SET_PDEATHSIG = 1
+
+def set_pdeathsig(sig: int = signal.SIGTERM) -> None:
+    """Request the kernel deliver a signal if the parent process terminates."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
+            errno = ctypes.get_errno()
+            sys.stderr.write(f"mcp-guardian: prctl(PR_SET_PDEATHSIG) failed: errno {errno}\n")
+    except OSError as err:
+        sys.stderr.write(f"mcp-guardian: failed to bind parent death signal: {err}\n")
+
+def terminate_process_group(proc: subprocess.Popen, timeout: float = 1.5) -> None:
+    """Send SIGTERM to child process group, escalating to SIGKILL on timeout."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError as err:
+        sys.stderr.write(f"mcp-guardian: unable to signal process group {pgid}: {err}\n")
+        return
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.05)
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+def set_nonblocking(fd: int) -> None:
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        sys.stderr.write(f"usage: {os.path.basename(sys.argv[0])} <command> [args...]\n")
+        return 1
+
+    cmd = sys.argv[1:]
+    interrupted = False
+
+    def on_signal(_signum, _frame):
+        nonlocal interrupted
+        interrupted = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+    set_pdeathsig(signal.SIGTERM)
+
+    def child_setup():
+        set_pdeathsig(signal.SIGTERM)
+        os.setpgrp()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            preexec_fn=child_setup,
+        )
+    except OSError as err:
+        sys.stderr.write(f"mcp-guardian: exec failed for '{cmd[0]}': {err}\n")
+        return 1
+
+    parent_pid = os.getppid()
+    stdin_fd = sys.stdin.fileno()
+    child_stdin_fd = proc.stdin.fileno()
+
+    set_nonblocking(stdin_fd)
+    set_nonblocking(child_stdin_fd)
+
+    in_queue = deque()
+    stdin_open = True
+    last_parent_check = time.monotonic()
+
+    while True:
+        if interrupted:
+            terminate_process_group(proc)
+            return 0
+
+        status = proc.poll()
+        if status is not None:
+            return status
+
+        now = time.monotonic()
+        if now - last_parent_check > 2.0:
+            last_parent_check = now
+            current_ppid = os.getppid()
+            if current_ppid != parent_pid or current_ppid == 1:
+                terminate_process_group(proc)
+                return 0
+
+        rlist = [stdin_fd] if stdin_open else []
+        wlist = [child_stdin_fd] if in_queue else []
+
+        try:
+            readable, writable, _ = select.select(rlist, wlist, [], 1.0)
+        except (select.error, InterruptedError):
+            continue
+
+        if stdin_fd in readable:
+            try:
+                chunk = os.read(stdin_fd, 16384)
+                if not chunk:
+                    stdin_open = False
+                else:
+                    in_queue.append(memoryview(chunk))
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError:
+                stdin_open = False
+
+        if child_stdin_fd in writable and in_queue:
+            chunk = in_queue[0]
+            try:
+                written = os.write(child_stdin_fd, chunk)
+                if written == len(chunk):
+                    in_queue.popleft()
+                else:
+                    in_queue[0] = chunk[written:]
+            except (BlockingIOError, InterruptedError):
+                pass
+            except BrokenPipeError:
+                terminate_process_group(proc)
+                return 0
+            except OSError:
+                terminate_process_group(proc)
+                return 0
+
+        if not stdin_open and not in_queue:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            terminate_process_group(proc)
+            return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

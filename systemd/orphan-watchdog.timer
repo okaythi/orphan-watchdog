@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic check for orphaned runaway processes
+After=multi-user.target
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

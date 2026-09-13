@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+    systemctl stop orphan-watchdog.timer || true
+    systemctl disable orphan-watchdog.timer || true
+    systemctl stop orphan-watchdog.service || true
+fi
+
+exit 0
