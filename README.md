@@ -1,6 +1,6 @@
 # orphan-watchdog
 
-[![CI](https://github.com/okaythi/orphan-watchdog/actions/workflows/ci.yml/badge.svg)](https://github.com/okaythi/orphan-watchdog/actions/workflows/ci.yml)
+[![CI](https://github.com/okaythi/orphan-watchdog/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/okaythi/orphan-watchdog/actions/workflows/ci.yml)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04%20LTS%2B-E95420?logo=ubuntu&logoColor=white&style=flat-square)](https://ubuntu.com)
 [![Release](https://img.shields.io/github/v/release/okaythi/orphan-watchdog?style=flat-square&color=2563eb)](https://github.com/okaythi/orphan-watchdog/releases)
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/license-CC%20BY--NC%204.0-334155?style=flat-square)](LICENSE)
