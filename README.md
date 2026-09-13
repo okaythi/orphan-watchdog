@@ -1,5 +1,10 @@
 # orphan-watchdog
 
+[![CI](https://github.com/okaythi/orphan-watchdog/actions/workflows/ci.yml/badge.svg)](https://github.com/okaythi/orphan-watchdog/actions/workflows/ci.yml)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04%20LTS%2B-E95420?logo=ubuntu&logoColor=white&style=flat-square)](https://ubuntu.com)
+[![Release](https://img.shields.io/github/v/release/okaythi/orphan-watchdog?style=flat-square&color=2563eb)](https://github.com/okaythi/orphan-watchdog/releases)
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/license-CC%20BY--NC%204.0-334155?style=flat-square)](LICENSE)
+
 A lightweight watchdog and process supervisor that prevents abandoned background processes and development servers from pegging CPU cores after their parent application exits.
 
 Designed for Linux workstations running Ubuntu 24.04 LTS and newer.
@@ -50,4 +55,4 @@ orphan-watchdog --dry-run
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+Creative Commons Attribution-NonCommercial 4.0 International ([CC BY-NC 4.0](LICENSE)).

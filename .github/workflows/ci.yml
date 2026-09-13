@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Ubuntu ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Python syntax
+        run: |
+          python3 -m py_compile bin/orphan-watchdog bin/mcp-guardian
+
+      - name: Build Debian package
+        run: |
+          make deb
+
+      - name: Install package
+        run: |
+          sudo dpkg -i orphan-watchdog_*.deb
+
+      - name: Test CLI flags & dry-run
+        run: |
+          orphan-watchdog --help
+          orphan-watchdog --dry-run
+
+      - name: Functional Test (mcp-guardian child teardown)
+        run: |
+          python3 -c '
+          import subprocess, time
+          p = subprocess.Popen(["mcp-guardian", "sleep", "60"], stdin=subprocess.PIPE)
+          time.sleep(0.3)
+          p.stdin.close()
+          p.wait(timeout=3)
+          assert p.returncode == 0
+          '
